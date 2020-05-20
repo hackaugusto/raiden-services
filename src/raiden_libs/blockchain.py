@@ -1,5 +1,5 @@
 from copy import deepcopy
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 import structlog
 from eth_abi.codec import ABICodec
@@ -114,6 +114,29 @@ def query_blockchain_events(
     return [decode_event(web3.codec, topic_to_event_abi, log_entry) for log_entry in events]
 
 
+def query_blockchain_logs(
+    web3: Web3, contracts_addresses: List[Address], from_block: BlockNumber, to_block: BlockNumber,
+) -> List[Dict]:
+    """ Returns events emmitted by the contracts within a certain range.
+
+    Args:
+        web3: A Web3 instance
+        contract_addresses: List of addresses of contracts to be queried for.
+        from_block: The block to start search events
+        to_block: The block to stop searching for events
+    """
+    filter_params = FilterParams(
+        {
+            "fromBlock": from_block,
+            "toBlock": to_block,
+            "address": [to_checksum_address(address) for address in contracts_addresses],
+            # "topics": [None],
+        }
+    )
+
+    return web3.eth.getLogs(filter_params)
+
+
 def parse_token_network_event(event: dict) -> Optional[Event]:
     event_name = event["event"]
 
@@ -167,58 +190,49 @@ def get_blockchain_events(
         num_blocks=to_block - from_block + 1,
     )
 
-    # first check for new token networks and add to state
-    registry_events = query_blockchain_events(
-        web3=web3,
-        contract_manager=contract_manager,
-        contract_address=chain_state.token_network_registry_address,
-        contract_name=CONTRACT_TOKEN_NETWORK_REGISTRY,
-        topics=create_registry_event_topics(contract_manager),
-        from_block=from_block,
-        to_block=to_block,
-    )
+    registry_abi = contract_manager.get_contract_abi(CONTRACT_TOKEN_NETWORK_REGISTRY)
+    token_network_abi = contract_manager.get_contract_abi(CONTRACT_TOKEN_NETWORK)
+    monitoring_abi = contract_manager.get_contract_abi(CONTRACT_MONITORING_SERVICE)
+
+    addresses_to_query = [chain_state.token_network_registry_address]
+    addresses_to_query += cast(List[Address], token_network_addresses)
+
+    # get events from monitoring service contract, this only queries the chain
+    # if the monitor contract address is set in chain_state
+    if chain_state.monitor_contract_address:
+        addresses_to_query.append(chain_state.monitor_contract_address)
 
     events: List[Event] = []
-    for event_dict in registry_events:
-        token_network_address = TokenNetworkAddress(
-            to_canonical_address(event_dict["args"]["token_network_address"])
-        )
-        events.append(
-            ReceiveTokenNetworkCreatedEvent(
-                token_network_address=token_network_address,
-                token_address=to_canonical_address(event_dict["args"]["token_address"]),
-                block_number=event_dict["blockNumber"],
-            )
-        )
-        token_network_addresses.append(token_network_address)
-
-    # then check all token networks
-    for token_network_address in token_network_addresses:
-        network_events = query_blockchain_events(
+    while addresses_to_query:
+        logs = query_blockchain_logs(
             web3=web3,
-            contract_manager=contract_manager,
-            contract_address=Address(token_network_address),
-            contract_name=CONTRACT_TOKEN_NETWORK,
-            topics=[None],
+            contracts_addresses=addresses_to_query,
             from_block=from_block,
             to_block=to_block,
         )
 
-        for event_dict in network_events:
-            event = parse_token_network_event(event_dict)
-            if event:
-                events.append(event)
+        # clean up the list of address to query, if there are new token
+        # networks registered they will be added here and fetched on the next
+        # iteration.
+        addresses_to_query = list()
 
-    # get events from monitoring service contract, this only queries the chain
-    # if the monitor contract address is set in chain_state
-    monitoring_events = get_monitoring_blockchain_events(
-        web3=web3,
-        contract_manager=contract_manager,
-        monitor_contract_address=chain_state.monitor_contract_address,
-        from_block=from_block,
-        to_block=to_block,
-    )
-    events.extend(monitoring_events)
+        for log_entry in logs:
+            if log_entry["address"] == chain_state.monitor_contract_address:
+                event = parse_monitoring_event(decode_log(web3, monitoring_abi, log_entry))
+                if event:
+                    events.append(event)
+            if log_entry["address"] == chain_state.token_network_registry_address:
+                event_data = decode_log(web3, registry_abi, log_entry)
+                events.append(parse_token_network_regitry_event(event_data))
+
+                new_token_network_address = TokenNetworkAddress(
+                    to_canonical_address(event_data["args"]["token_network_address"])
+                )
+                addresses_to_query.append(Address(new_token_network_address))
+            else:
+                event = parse_token_network_event(decode_log(web3, token_network_abi, log_entry))
+                if event:
+                    events.append(event)
 
     # commit new block number
     events.append(UpdatedHeadBlockEvent(head_block_number=to_block))
@@ -226,56 +240,50 @@ def get_blockchain_events(
     return events
 
 
-def get_monitoring_blockchain_events(
-    web3: Web3,
-    contract_manager: ContractManager,
-    monitor_contract_address: Optional[Address],
-    from_block: BlockNumber,
-    to_block: BlockNumber,
-) -> List[Event]:
-    if monitor_contract_address is None:
-        return []
+def decode_log(web3: Web3, contract_abi: List[Dict[str, Any]], log_entry: dict) -> dict:
+    events_abi = filter_by_type("event", contract_abi)
+    topic_to_event_abi: Dict[bytes, ABIEvent] = {
+        event_abi_to_log_topic(event_abi): event_abi for event_abi in events_abi  # type: ignore
+    }
+    return decode_event(web3.codec, topic_to_event_abi, log_entry)
 
-    monitoring_service_events = query_blockchain_events(
-        web3=web3,
-        contract_manager=contract_manager,
-        contract_address=monitor_contract_address,
-        contract_name=CONTRACT_MONITORING_SERVICE,
-        topics=[None],
-        from_block=from_block,
-        to_block=to_block,
+
+def parse_token_network_regitry_event(event: Dict) -> Event:
+    new_token_network_address = TokenNetworkAddress(
+        to_canonical_address(event["args"]["token_network_address"])
+    )
+    return ReceiveTokenNetworkCreatedEvent(
+        token_network_address=new_token_network_address,
+        token_address=to_canonical_address(event["args"]["token_address"]),
+        block_number=event["blockNumber"],
     )
 
-    events: List[Event] = []
-    for event in monitoring_service_events:
-        event_name = event["event"]
-        block_number = event["blockNumber"]
 
-        if event_name == MonitoringServiceEvent.NEW_BALANCE_PROOF_RECEIVED:
-            events.append(
-                ReceiveMonitoringNewBalanceProofEvent(
-                    token_network_address=TokenNetworkAddress(
-                        to_canonical_address(event["args"]["token_network_address"])
-                    ),
-                    channel_identifier=event["args"]["channel_identifier"],
-                    reward_amount=event["args"]["reward_amount"],
-                    nonce=event["args"]["nonce"],
-                    ms_address=to_canonical_address(event["args"]["ms_address"]),
-                    raiden_node_address=to_canonical_address(event["args"]["raiden_node_address"]),
-                    block_number=block_number,
-                )
-            )
-        elif event_name == MonitoringServiceEvent.REWARD_CLAIMED:
-            events.append(
-                ReceiveMonitoringRewardClaimedEvent(
-                    ms_address=to_canonical_address(event["args"]["ms_address"]),
-                    amount=event["args"]["amount"],
-                    reward_identifier=encode_hex(event["args"]["reward_identifier"]),
-                    block_number=block_number,
-                )
-            )
+def parse_monitoring_event(event: Dict) -> Optional[Event]:
+    event_name = event["event"]
+    block_number = event["blockNumber"]
 
-    return events
+    if event_name == MonitoringServiceEvent.NEW_BALANCE_PROOF_RECEIVED:
+        return ReceiveMonitoringNewBalanceProofEvent(
+            token_network_address=TokenNetworkAddress(
+                to_canonical_address(event["args"]["token_network_address"])
+            ),
+            channel_identifier=event["args"]["channel_identifier"],
+            reward_amount=event["args"]["reward_amount"],
+            nonce=event["args"]["nonce"],
+            ms_address=to_canonical_address(event["args"]["ms_address"]),
+            raiden_node_address=to_canonical_address(event["args"]["raiden_node_address"]),
+            block_number=block_number,
+        )
+    elif event_name == MonitoringServiceEvent.REWARD_CLAIMED:
+        return ReceiveMonitoringRewardClaimedEvent(
+            ms_address=to_canonical_address(event["args"]["ms_address"]),
+            amount=event["args"]["amount"],
+            reward_identifier=encode_hex(event["args"]["reward_identifier"]),
+            block_number=block_number,
+        )
+
+    return None
 
 
 def get_pessimistic_udc_balance(
